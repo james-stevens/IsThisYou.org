@@ -1,0 +1,696 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DNSSEC Zone Signer</title>
+    <style>
+        body {
+            font-family: system-ui, -apple-system, sans-serif;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            background: #1a1a2e;
+            color: #eee;
+        }
+        h1 { color: #00d4ff; }
+        h2 { color: #00d4ff; margin-top: 30px; }
+        .row { display: flex; gap: 20px; }
+        .col { flex: 1; }
+        textarea {
+            width: 100%;
+            height: 400px;
+            font-family: monospace;
+            font-size: 13px;
+            background: #2a2a4e;
+            color: #fff;
+            border: 1px solid #444;
+            border-radius: 4px;
+            padding: 10px;
+            box-sizing: border-box;
+        }
+        button {
+            padding: 12px 24px;
+            font-size: 16px;
+            background: #00d4ff;
+            color: #1a1a2e;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-weight: bold;
+            margin: 10px 5px 10px 0;
+        }
+        button:hover { background: #00a8cc; }
+        .key-section {
+            background: #2a2a4e;
+            border-radius: 8px;
+            padding: 15px;
+            margin: 15px 0;
+        }
+        .key-section h3 { margin-top: 0; color: #00ff88; }
+        .key-display {
+            font-family: monospace;
+            font-size: 12px;
+            background: #1a1a2e;
+            padding: 10px;
+            border-radius: 4px;
+            word-break: break-all;
+            margin: 5px 0;
+        }
+        .ds-record {
+            background: #5a4527;
+            padding: 15px;
+            border-radius: 8px;
+            margin: 15px 0;
+        }
+        .ds-record h3 { margin-top: 0; color: #ffaa00; }
+        label { display: block; margin: 10px 0 5px; }
+        input[type="text"], input[type="number"] {
+            padding: 8px;
+            font-size: 14px;
+            background: #2a2a4e;
+            color: #fff;
+            border: 1px solid #444;
+            border-radius: 4px;
+            width: 200px;
+        }
+        .info { color: #888; font-size: 12px; }
+    </style>
+</head>
+<body>
+    <h1>DNSSEC Zone Signer</h1>
+
+    <div>
+        <label for="zoneName">Zone Name:</label>
+        <input type="text" id="zoneName" value="webmail." placeholder="example.com.">
+        <span class="info">(must end with dot)</span>
+    </div>
+    <div>
+        <label for="ttl">Signature TTL:</label>
+        <input type="number" id="ttl" value="600">
+    </div>
+    <div>
+        <label for="validity">Signature Validity (days):</label>
+        <input type="number" id="validity" value="30">
+    </div>
+
+    <button onclick="generateKeys()">1. Generate Keys</button>
+    <button onclick="signZone()">2. Sign Zone</button>
+
+    <div id="keys"></div>
+
+    <h2>Zone Data</h2>
+    <div class="row">
+        <div class="col">
+            <h3>Input (unsigned zone)</h3>
+            <textarea id="input">[
+  {
+    "TTL": 600,
+    "data": "ns1.webmail. hostmaster.webmail. 2024010101 3600 600 604800 600",
+    "name": "webmail.",
+    "type": 6,
+    "typename": "SOA"
+  },
+  {
+    "TTL": 600,
+    "data": "ns1.webmail.",
+    "name": "webmail.",
+    "type": 2,
+    "typename": "NS"
+  },
+  {
+    "TTL": 600,
+    "data": "82.68.70.165",
+    "name": "webmail.",
+    "type": 1,
+    "typename": "A"
+  },
+  {
+    "TTL": 600,
+    "data": "82.68.70.164",
+    "name": "webmail.",
+    "type": 1,
+    "typename": "A"
+  },
+  {
+    "TTL": 600,
+    "data": "10 mail.webmail.",
+    "name": "webmail.",
+    "type": 15,
+    "typename": "MX"
+  },
+  {
+    "TTL": 600,
+    "data": "82.68.70.165",
+    "name": "mail.webmail.",
+    "type": 1,
+    "typename": "A"
+  },
+  {
+    "TTL": 600,
+    "data": "82.68.70.165",
+    "name": "ns1.webmail.",
+    "type": 1,
+    "typename": "A"
+  },
+  {
+    "TTL": 600,
+    "data": "\"v=spf1 mx -all\"",
+    "name": "webmail.",
+    "type": 16,
+    "typename": "TXT"
+  }
+]</textarea>
+        </div>
+        <div class="col">
+            <h3>Output (signed zone)</h3>
+            <textarea id="output" readonly></textarea>
+        </div>
+    </div>
+
+    <script>
+// Record type numbers
+const TYPES = {
+    A: 1, NS: 2, SOA: 6, MX: 15, TXT: 16, AAAA: 28,
+    RRSIG: 46, NSEC: 47, DNSKEY: 48, DS: 43, URI: 256, WALLET: 65280
+};
+const TYPE_NAMES = Object.fromEntries(Object.entries(TYPES).map(([k,v]) => [v, k]));
+
+let ksk = null;
+let zsk = null;
+
+// === Utility Functions ===
+
+function bytesToB64(bytes) {
+    return btoa(String.fromCharCode(...bytes));
+}
+
+function b64ToBytes(b64) {
+    const binary = atob(b64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return bytes;
+}
+
+// Convert DNS name to wire format (lowercase for canonical)
+function nameToWire(name) {
+    if (!name.endsWith('.')) name += '.';
+    const labels = name.toLowerCase().split('.').filter(l => l.length > 0);
+    const parts = [];
+    for (const label of labels) {
+        parts.push(label.length);
+        for (let i = 0; i < label.length; i++) parts.push(label.charCodeAt(i));
+    }
+    parts.push(0);
+    return new Uint8Array(parts);
+}
+
+// Calculate DNSKEY key tag (RFC 4034)
+function calculateKeyTag(dnskeyRdata) {
+    let ac = 0;
+    for (let i = 0; i < dnskeyRdata.length; i++) {
+        ac += (i & 1) ? dnskeyRdata[i] : dnskeyRdata[i] << 8;
+    }
+    ac += (ac >> 16) & 0xFFFF;
+    return ac & 0xFFFF;
+}
+
+// Convert IP address to wire format
+function ipToWire(ip) {
+    return new Uint8Array(ip.split('.').map(n => parseInt(n)));
+}
+
+// Convert integer to 2-byte big-endian
+function uint16ToWire(n) {
+    return new Uint8Array([(n >> 8) & 0xff, n & 0xff]);
+}
+
+// Convert integer to 4-byte big-endian
+function uint32ToWire(n) {
+    return new Uint8Array([(n >> 24) & 0xff, (n >> 16) & 0xff, (n >> 8) & 0xff, n & 0xff]);
+}
+
+// Parse and encode SOA rdata
+function soaToWire(data) {
+    const parts = data.split(/\s+/);
+    const mname = nameToWire(parts[0]);
+    const rname = nameToWire(parts[1]);
+    const serial = uint32ToWire(parseInt(parts[2]));
+    const refresh = uint32ToWire(parseInt(parts[3]));
+    const retry = uint32ToWire(parseInt(parts[4]));
+    const expire = uint32ToWire(parseInt(parts[5]));
+    const minimum = uint32ToWire(parseInt(parts[6]));
+
+    const result = new Uint8Array(mname.length + rname.length + 20);
+    let offset = 0;
+    result.set(mname, offset); offset += mname.length;
+    result.set(rname, offset); offset += rname.length;
+    result.set(serial, offset); offset += 4;
+    result.set(refresh, offset); offset += 4;
+    result.set(retry, offset); offset += 4;
+    result.set(expire, offset); offset += 4;
+    result.set(minimum, offset);
+    return result;
+}
+
+// Parse and encode MX rdata
+function mxToWire(data) {
+    const match = data.match(/^(\d+)\s+(.+)$/);
+    const preference = uint16ToWire(parseInt(match[1]));
+    const exchange = nameToWire(match[2]);
+    const result = new Uint8Array(2 + exchange.length);
+    result.set(preference, 0);
+    result.set(exchange, 2);
+    return result;
+}
+
+// Parse and encode TXT rdata
+function txtToWire(data) {
+    // Remove surrounding quotes if present
+    let text = data;
+    if (text.startsWith('"') && text.endsWith('"')) {
+        text = text.slice(1, -1);
+    }
+    // Handle escape sequences
+    text = text.replace(/\\"/g, '"');
+
+    const encoder = new TextEncoder();
+    const textBytes = encoder.encode(text);
+
+    // TXT records are length-prefixed strings (max 255 bytes per chunk)
+    const chunks = [];
+    for (let i = 0; i < textBytes.length; i += 255) {
+        const chunk = textBytes.slice(i, i + 255);
+        chunks.push(chunk.length, ...chunk);
+    }
+    return new Uint8Array(chunks);
+}
+
+// Parse and encode URI rdata (RFC 7553)
+function uriToWire(data) {
+    const match = data.match(/^(\d+)\s+(\d+)\s+"(.+)"$/);
+    if (!match) throw new Error('Invalid URI format: ' + data);
+    const priority = uint16ToWire(parseInt(match[1]));
+    const weight = uint16ToWire(parseInt(match[2]));
+    const target = new TextEncoder().encode(match[3]);
+    const result = new Uint8Array(4 + target.length);
+    result.set(priority, 0);
+    result.set(weight, 2);
+    result.set(target, 4);
+    return result;
+}
+
+// Encode WALLET rdata (custom - assume it's just text)
+function walletToWire(data) {
+    return new TextEncoder().encode(data);
+}
+
+// Convert record data to wire format based on type
+function rdataToWire(type, data) {
+    switch (type) {
+        case TYPES.A:
+            return ipToWire(data);
+        case TYPES.NS:
+            return nameToWire(data);
+        case TYPES.SOA:
+            return soaToWire(data);
+        case TYPES.MX:
+            return mxToWire(data);
+        case TYPES.TXT:
+            return txtToWire(data);
+        case TYPES.URI:
+            return uriToWire(data);
+        case TYPES.WALLET:
+            return walletToWire(data);
+        case TYPES.DNSKEY:
+        case TYPES.RRSIG:
+        case TYPES.NSEC:
+            // Already in wire format as Uint8Array
+            return data;
+        default:
+            throw new Error('Unsupported record type: ' + type);
+    }
+}
+
+// === Key Generation ===
+
+async function generateKeys() {
+    const zoneName = document.getElementById('zoneName').value;
+
+    // Generate KSK (flags 257)
+    const kskPair = await crypto.subtle.generateKey(
+        { name: 'ECDSA', namedCurve: 'P-256' },
+        true,
+        ['sign', 'verify']
+    );
+
+    // Generate ZSK (flags 256)
+    const zskPair = await crypto.subtle.generateKey(
+        { name: 'ECDSA', namedCurve: 'P-256' },
+        true,
+        ['sign', 'verify']
+    );
+
+    // Export public keys
+    const kskPub = new Uint8Array(await crypto.subtle.exportKey('raw', kskPair.publicKey));
+    const zskPub = new Uint8Array(await crypto.subtle.exportKey('raw', zskPair.publicKey));
+
+    // Remove 0x04 prefix (uncompressed point indicator)
+    const kskPubKey = kskPub.slice(1);
+    const zskPubKey = zskPub.slice(1);
+
+    // Build DNSKEY rdata
+    // Flags (2) + Protocol (1) + Algorithm (1) + Public Key
+    const kskRdata = new Uint8Array(4 + kskPubKey.length);
+    kskRdata[0] = 0x01; kskRdata[1] = 0x01; // flags 257 (KSK)
+    kskRdata[2] = 3; // protocol (always 3)
+    kskRdata[3] = 13; // algorithm (ECDSAP256SHA256)
+    kskRdata.set(kskPubKey, 4);
+
+    const zskRdata = new Uint8Array(4 + zskPubKey.length);
+    zskRdata[0] = 0x01; zskRdata[1] = 0x00; // flags 256 (ZSK)
+    zskRdata[2] = 3;
+    zskRdata[3] = 13;
+    zskRdata.set(zskPubKey, 4);
+
+    const kskKeyTag = calculateKeyTag(kskRdata);
+    const zskKeyTag = calculateKeyTag(zskRdata);
+
+    ksk = {
+        privateKey: kskPair.privateKey,
+        publicKey: kskPair.publicKey,
+        rdata: kskRdata,
+        keyTag: kskKeyTag,
+        flags: 257
+    };
+
+    zsk = {
+        privateKey: zskPair.privateKey,
+        publicKey: zskPair.publicKey,
+        rdata: zskRdata,
+        keyTag: zskKeyTag,
+        flags: 256
+    };
+
+    // Generate DS record (SHA-256 digest of KSK)
+    const dsInput = new Uint8Array(nameToWire(zoneName).length + kskRdata.length);
+    dsInput.set(nameToWire(zoneName), 0);
+    dsInput.set(kskRdata, nameToWire(zoneName).length);
+    const dsDigest = new Uint8Array(await crypto.subtle.digest('SHA-256', dsInput));
+
+    const dsRecord = `${zoneName} IN DS ${kskKeyTag} 13 2 ${Array.from(dsDigest).map(b => b.toString(16).padStart(2, '0')).join('').toUpperCase()}`;
+
+    // Display keys
+    document.getElementById('keys').innerHTML = `
+        <div class="key-section">
+            <h3>Zone Signing Key (ZSK) - Key Tag: ${zskKeyTag}</h3>
+            <div class="key-display">Flags: 256 | Algorithm: 13 (ECDSAP256SHA256)</div>
+            <div class="key-display">Public Key: ${bytesToB64(zskPubKey)}</div>
+        </div>
+        <div class="key-section">
+            <h3>Key Signing Key (KSK) - Key Tag: ${kskKeyTag}</h3>
+            <div class="key-display">Flags: 257 | Algorithm: 13 (ECDSAP256SHA256)</div>
+            <div class="key-display">Public Key: ${bytesToB64(kskPubKey)}</div>
+        </div>
+        <div class="ds-record">
+            <h3>DS Record (for parent zone)</h3>
+            <div class="key-display">${dsRecord}</div>
+        </div>
+    `;
+}
+
+// === Zone Signing ===
+
+async function signRRset(records, signerName, key, ttl, inception, expiration) {
+    if (records.length === 0) return null;
+
+    const ownerName = records[0].name;
+    const rrtype = records[0].type;
+    const labels = ownerName.replace(/\.$/, '').split('.').length;
+
+    // Build RRSIG RDATA (without signature)
+    // Type Covered (2) + Algorithm (1) + Labels (1) + Original TTL (4) +
+    // Sig Expiration (4) + Sig Inception (4) + Key Tag (2) + Signer's Name
+    const signerWire = nameToWire(signerName);
+    const rrsigHeader = new Uint8Array(18 + signerWire.length);
+    const view = new DataView(rrsigHeader.buffer);
+
+    view.setUint16(0, rrtype);
+    rrsigHeader[2] = 13; // algorithm
+    rrsigHeader[3] = labels;
+    view.setUint32(4, ttl);
+    view.setUint32(8, expiration);
+    view.setUint32(12, inception);
+    view.setUint16(16, key.keyTag);
+    rrsigHeader.set(signerWire, 18);
+
+    // Sort records by rdata (canonical order)
+    const sortedRecords = [...records].sort((a, b) => {
+        const aRdata = rdataToWire(a.type, a.data);
+        const bRdata = rdataToWire(b.type, b.data);
+        for (let i = 0; i < Math.min(aRdata.length, bRdata.length); i++) {
+            if (aRdata[i] !== bRdata[i]) return aRdata[i] - bRdata[i];
+        }
+        return aRdata.length - bRdata.length;
+    });
+
+    // Build RRset in wire format
+    const ownerWire = nameToWire(ownerName);
+    const rrWires = [];
+
+    for (const rr of sortedRecords) {
+        const rdata = rdataToWire(rr.type, rr.data);
+        const rrWire = new Uint8Array(ownerWire.length + 10 + rdata.length);
+        const rrView = new DataView(rrWire.buffer);
+
+        let offset = 0;
+        rrWire.set(ownerWire, offset); offset += ownerWire.length;
+        rrView.setUint16(offset, rrtype); offset += 2;
+        rrView.setUint16(offset, 1); offset += 2; // class IN
+        rrView.setUint32(offset, ttl); offset += 4;
+        rrView.setUint16(offset, rdata.length); offset += 2;
+        rrWire.set(rdata, offset);
+
+        rrWires.push(rrWire);
+    }
+
+    // Concatenate for signing
+    const totalLen = rrsigHeader.length + rrWires.reduce((s, w) => s + w.length, 0);
+    const signedData = new Uint8Array(totalLen);
+    let offset = 0;
+    signedData.set(rrsigHeader, offset); offset += rrsigHeader.length;
+    for (const rrWire of rrWires) {
+        signedData.set(rrWire, offset);
+        offset += rrWire.length;
+    }
+
+    // Sign with ECDSA
+    const signature = new Uint8Array(await crypto.subtle.sign(
+        { name: 'ECDSA', hash: 'SHA-256' },
+        key.privateKey,
+        signedData
+    ));
+
+    // Build complete RRSIG rdata
+    const rrsigRdata = new Uint8Array(rrsigHeader.length + signature.length);
+    rrsigRdata.set(rrsigHeader, 0);
+    rrsigRdata.set(signature, rrsigHeader.length);
+
+    // Format expiration/inception as YYYYMMDDHHMMSS
+    const formatTime = (ts) => {
+        const d = new Date(ts * 1000);
+        return d.getUTCFullYear().toString() +
+            (d.getUTCMonth() + 1).toString().padStart(2, '0') +
+            d.getUTCDate().toString().padStart(2, '0') +
+            d.getUTCHours().toString().padStart(2, '0') +
+            d.getUTCMinutes().toString().padStart(2, '0') +
+            d.getUTCSeconds().toString().padStart(2, '0');
+    };
+
+    return {
+        TTL: ttl,
+        name: ownerName,
+        type: TYPES.RRSIG,
+        typename: 'RRSIG',
+        data: `${TYPE_NAMES[rrtype] || rrtype} 13 ${labels} ${ttl} ${formatTime(expiration)} ${formatTime(inception)} ${key.keyTag} ${signerName} ${bytesToB64(signature)}`,
+        rdata: bytesToB64(rrsigRdata)
+    };
+}
+
+function buildNSEC(ownerName, nextName, types) {
+    // NSEC RDATA: Next Domain Name + Type Bit Maps
+    const nextWire = nameToWire(nextName);
+
+    // Build type bitmap
+    // Group types by window (high byte)
+    const windows = new Map();
+    for (const type of types) {
+        const window = (type >> 8) & 0xff;
+        const bit = type & 0xff;
+        if (!windows.has(window)) windows.set(window, new Set());
+        windows.get(window).add(bit);
+    }
+
+    // Build bitmap blocks
+    const bitmapParts = [];
+    for (const [window, bits] of [...windows.entries()].sort((a, b) => a[0] - b[0])) {
+        const maxBit = Math.max(...bits);
+        const bitmapLen = Math.ceil((maxBit + 1) / 8);
+        const bitmap = new Uint8Array(bitmapLen);
+
+        for (const bit of bits) {
+            const byteIndex = Math.floor(bit / 8);
+            const bitIndex = 7 - (bit % 8);
+            bitmap[byteIndex] |= (1 << bitIndex);
+        }
+
+        bitmapParts.push(window, bitmapLen, ...bitmap);
+    }
+
+    const nsecRdata = new Uint8Array(nextWire.length + bitmapParts.length);
+    nsecRdata.set(nextWire, 0);
+    nsecRdata.set(new Uint8Array(bitmapParts), nextWire.length);
+
+    // Format types for display
+    const typeNames = types.map(t => TYPE_NAMES[t] || `TYPE${t}`).join(' ');
+
+    return {
+        rdata: nsecRdata,
+        data: `${nextName} ${typeNames}`
+    };
+}
+
+// Canonical DNS name comparison
+function compareNames(a, b) {
+    const aLabels = a.toLowerCase().replace(/\.$/, '').split('.').reverse();
+    const bLabels = b.toLowerCase().replace(/\.$/, '').split('.').reverse();
+
+    for (let i = 0; i < Math.min(aLabels.length, bLabels.length); i++) {
+        if (aLabels[i] < bLabels[i]) return -1;
+        if (aLabels[i] > bLabels[i]) return 1;
+    }
+    return aLabels.length - bLabels.length;
+}
+
+async function signZone() {
+    if (!ksk || !zsk) {
+        alert('Please generate keys first!');
+        return;
+    }
+
+    const zoneName = document.getElementById('zoneName').value;
+    const ttl = parseInt(document.getElementById('ttl').value);
+    const validityDays = parseInt(document.getElementById('validity').value);
+
+    const now = Math.floor(Date.now() / 1000);
+    const inception = now - 3600; // 1 hour ago
+    const expiration = now + (validityDays * 86400);
+
+    let inputRecords;
+    try {
+        inputRecords = JSON.parse(document.getElementById('input').value);
+    } catch (e) {
+        alert('Invalid JSON: ' + e.message);
+        return;
+    }
+
+    // Add DNSKEY records
+    const dnskeyRecords = [
+        {
+            TTL: ttl,
+            name: zoneName,
+            type: TYPES.DNSKEY,
+            typename: 'DNSKEY',
+            data: `256 3 13 ${bytesToB64(zsk.rdata.slice(4))}`,
+            rdata: bytesToB64(zsk.rdata)
+        },
+        {
+            TTL: ttl,
+            name: zoneName,
+            type: TYPES.DNSKEY,
+            typename: 'DNSKEY',
+            data: `257 3 13 ${bytesToB64(ksk.rdata.slice(4))}`,
+            rdata: bytesToB64(ksk.rdata)
+        }
+    ];
+
+    const allRecords = [...inputRecords, ...dnskeyRecords];
+    const output = [...allRecords];
+
+    // Group records by name and type (RRsets)
+    const rrsets = new Map();
+    for (const record of allRecords) {
+        const key = `${record.name.toLowerCase()}|${record.type}`;
+        if (!rrsets.has(key)) rrsets.set(key, []);
+        rrsets.get(key).push(record);
+    }
+
+    // Get all unique names for NSEC chain
+    const names = [...new Set(allRecords.map(r => r.name.toLowerCase()))].sort(compareNames);
+
+    // Get types per name for NSEC
+    const typesPerName = new Map();
+    for (const record of allRecords) {
+        const name = record.name.toLowerCase();
+        if (!typesPerName.has(name)) typesPerName.set(name, new Set());
+        typesPerName.get(name).add(record.type);
+    }
+
+    // Add NSEC type to each name (and RRSIG)
+    for (const [name, types] of typesPerName) {
+        types.add(TYPES.NSEC);
+        types.add(TYPES.RRSIG);
+    }
+
+    // Generate NSEC records
+    const nsecRecords = [];
+    for (let i = 0; i < names.length; i++) {
+        const name = names[i];
+        const nextName = names[(i + 1) % names.length]; // Wrap around to first
+        const types = [...typesPerName.get(name)].sort((a, b) => a - b);
+
+        const nsec = buildNSEC(name, nextName, types);
+        const nsecRecord = {
+            TTL: ttl,
+            name: name.endsWith('.') ? name : name + '.',
+            type: TYPES.NSEC,
+            typename: 'NSEC',
+            data: nsec.data,
+            rdata: bytesToB64(nsec.rdata)
+        };
+        nsecRecords.push(nsecRecord);
+        output.push(nsecRecord);
+
+        // Add to rrsets for signing
+        const key = `${name}|${TYPES.NSEC}`;
+        rrsets.set(key, [nsecRecord]);
+    }
+
+    // Sign all RRsets
+    const rrsigs = [];
+    for (const [key, records] of rrsets) {
+        const rrtype = records[0].type;
+
+        // DNSKEY is signed by KSK, everything else by ZSK
+        const signingKey = (rrtype === TYPES.DNSKEY) ? ksk : zsk;
+
+        const rrsig = await signRRset(records, zoneName, signingKey, ttl, inception, expiration);
+        if (rrsig) {
+            rrsigs.push(rrsig);
+            output.push(rrsig);
+        }
+    }
+
+    // Sort output by name, then type
+    output.sort((a, b) => {
+        const nameComp = compareNames(a.name, b.name);
+        if (nameComp !== 0) return nameComp;
+        return a.type - b.type;
+    });
+
+    document.getElementById('output').value = JSON.stringify(output, null, 2);
+}
+
+    </script>
+</body>
+</html>

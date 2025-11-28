@@ -1,0 +1,461 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DNSSEC Validator</title>
+    <style>
+        body {
+            font-family: system-ui, -apple-system, sans-serif;
+            max-width: 900px;
+            margin: 0 auto;
+            padding: 20px;
+            background: #1a1a2e;
+            color: #eee;
+        }
+        h1 { color: #00d4ff; }
+        .input-group {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+        input[type="text"] {
+            flex: 1;
+            padding: 10px;
+            font-size: 16px;
+            border: 1px solid #444;
+            border-radius: 4px;
+            background: #2a2a4e;
+            color: #fff;
+        }
+        button {
+            padding: 10px 20px;
+            font-size: 16px;
+            background: #00d4ff;
+            color: #1a1a2e;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-weight: bold;
+        }
+        button:hover { background: #00a8cc; }
+        .record-section {
+            background: #2a2a4e;
+            border-radius: 8px;
+            padding: 15px;
+            margin-bottom: 15px;
+        }
+        .record-section h3 {
+            margin-top: 0;
+            color: #00d4ff;
+            border-bottom: 1px solid #444;
+            padding-bottom: 10px;
+        }
+        .record {
+            background: #1a1a2e;
+            padding: 10px;
+            margin: 10px 0;
+            border-radius: 4px;
+            font-family: monospace;
+            font-size: 13px;
+            word-break: break-all;
+        }
+        .valid { border-left: 4px solid #00ff88; }
+        .invalid { border-left: 4px solid #ff4444; }
+        .pending { border-left: 4px solid #ffaa00; }
+        .status {
+            display: inline-block;
+            padding: 3px 8px;
+            border-radius: 3px;
+            font-weight: bold;
+            margin-left: 10px;
+        }
+        .status.valid { background: #00ff8833; color: #00ff88; }
+        .status.invalid { background: #ff444433; color: #ff4444; }
+        .status.pending { background: #ffaa0033; color: #ffaa00; }
+        .details { color: #aaa; font-size: 12px; margin-top: 5px; }
+        .chain-viz {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin: 20px 0;
+            flex-wrap: wrap;
+        }
+        .chain-node {
+            padding: 10px 15px;
+            border-radius: 6px;
+            text-align: center;
+        }
+        .chain-arrow { color: #00d4ff; font-size: 24px; }
+        .key-zsk { background: #2d5a27; }
+        .key-ksk { background: #5a2727; }
+        .key-record { background: #27415a; }
+        pre { margin: 0; white-space: pre-wrap; }
+    </style>
+</head>
+<body>
+    <h1>DNSSEC Browser Validator</h1>
+
+    <div class="input-group">
+        <input type="text" id="domain" placeholder="Enter domain (e.g., webmail)" value="webmail">
+        <button onclick="validate()">Validate DNSSEC</button>
+    </div>
+
+    <div id="results"></div>
+
+    <script>
+const API_BASE = 'https://api.web3dns.net/';
+
+// Decode base64 to Uint8Array
+function b64ToBytes(b64) {
+    const binary = atob(b64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) {
+        bytes[i] = binary.charCodeAt(i);
+    }
+    return bytes;
+}
+
+function bytesToHex(bytes) {
+    return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+// Parse RRSIG rdata
+function parseRRSIG(rdata) {
+    const bytes = b64ToBytes(rdata);
+    const view = new DataView(bytes.buffer);
+
+    const typeCovered = view.getUint16(0);
+    const algorithm = bytes[2];
+    const labels = bytes[3];
+    const originalTTL = view.getUint32(4);
+    const sigExpiration = view.getUint32(8);
+    const sigInception = view.getUint32(12);
+    const keyTag = view.getUint16(16);
+
+    // Parse signer's name (wire format starting at offset 18)
+    let offset = 18;
+    let signerName = '';
+    while (bytes[offset] !== 0) {
+        const labelLen = bytes[offset];
+        offset++;
+        for (let i = 0; i < labelLen; i++) {
+            signerName += String.fromCharCode(bytes[offset + i]);
+        }
+        offset += labelLen;
+        signerName += '.';
+    }
+    offset++; // skip null terminator
+
+    // Signature is the rest
+    const signature = bytes.slice(offset);
+
+    // RRSIG RDATA without signature (for verification)
+    const rrsigRdataNoSig = bytes.slice(0, offset);
+
+    return {
+        typeCovered,
+        algorithm,
+        labels,
+        originalTTL,
+        sigExpiration,
+        sigInception,
+        keyTag,
+        signerName,
+        signature,
+        rrsigRdataNoSig,
+        raw: bytes
+    };
+}
+
+// Parse DNSKEY rdata
+function parseDNSKEY(rdata) {
+    const bytes = b64ToBytes(rdata);
+    const view = new DataView(bytes.buffer);
+
+    const flags = view.getUint16(0);
+    const protocol = bytes[2];
+    const algorithm = bytes[3];
+    const publicKey = bytes.slice(4);
+
+    // Calculate key tag (RFC 4034)
+    let ac = 0;
+    for (let i = 0; i < bytes.length; i++) {
+        ac += (i & 1) ? bytes[i] : bytes[i] << 8;
+    }
+    ac += (ac >> 16) & 0xFFFF;
+    const keyTag = ac & 0xFFFF;
+
+    return {
+        flags,
+        protocol,
+        algorithm,
+        publicKey,
+        keyTag,
+        isKSK: (flags & 1) === 1,
+        isZSK: (flags & 1) === 0,
+        raw: bytes
+    };
+}
+
+// Convert DNS name to wire format
+function nameToWire(name) {
+    // Ensure trailing dot
+    if (!name.endsWith('.')) name += '.';
+
+    const labels = name.split('.').filter(l => l.length > 0);
+    const parts = [];
+
+    for (const label of labels) {
+        parts.push(label.length);
+        for (let i = 0; i < label.length; i++) {
+            parts.push(label.toLowerCase().charCodeAt(i));
+        }
+    }
+    parts.push(0); // null terminator
+
+    return new Uint8Array(parts);
+}
+
+// Build the data to be signed for RRSIG verification
+function buildSignedData(rrsig, rrset, ownerName, rrtype) {
+    // Signed data = RRSIG_RDATA (without sig) + RRset in canonical order
+
+    const ownerWire = nameToWire(ownerName);
+
+    // Sort RRset by rdata (canonical order)
+    const sortedRRset = [...rrset].sort((a, b) => {
+        const aBytes = b64ToBytes(a.rdata);
+        const bBytes = b64ToBytes(b.rdata);
+        for (let i = 0; i < Math.min(aBytes.length, bBytes.length); i++) {
+            if (aBytes[i] !== bBytes[i]) return aBytes[i] - bBytes[i];
+        }
+        return aBytes.length - bBytes.length;
+    });
+
+    // Build RR records in wire format
+    const rrWires = [];
+    for (const rr of sortedRRset) {
+        const rdataBytes = b64ToBytes(rr.rdata);
+
+        // owner name (wire) + type (2) + class (2) + TTL (4) + rdlength (2) + rdata
+        const rrWire = new Uint8Array(ownerWire.length + 2 + 2 + 4 + 2 + rdataBytes.length);
+        const view = new DataView(rrWire.buffer);
+
+        let offset = 0;
+        rrWire.set(ownerWire, offset); offset += ownerWire.length;
+        view.setUint16(offset, rrtype); offset += 2;
+        view.setUint16(offset, 1); offset += 2; // class IN
+        view.setUint32(offset, rrsig.originalTTL); offset += 4;
+        view.setUint16(offset, rdataBytes.length); offset += 2;
+        rrWire.set(rdataBytes, offset);
+
+        rrWires.push(rrWire);
+    }
+
+    // Concatenate: RRSIG_RDATA (no sig) + all RR wires
+    const totalLen = rrsig.rrsigRdataNoSig.length + rrWires.reduce((s, w) => s + w.length, 0);
+    const signedData = new Uint8Array(totalLen);
+
+    let offset = 0;
+    signedData.set(rrsig.rrsigRdataNoSig, offset); offset += rrsig.rrsigRdataNoSig.length;
+    for (const rrWire of rrWires) {
+        signedData.set(rrWire, offset);
+        offset += rrWire.length;
+    }
+
+    return signedData;
+}
+
+// Import ECDSA P-256 public key for WebCrypto
+async function importECDSAKey(publicKeyBytes) {
+    // Algorithm 13 = ECDSA P-256
+    // Public key is 64 bytes: X (32) + Y (32)
+    // WebCrypto expects uncompressed format: 0x04 + X + Y
+
+    const uncompressed = new Uint8Array(65);
+    uncompressed[0] = 0x04;
+    uncompressed.set(publicKeyBytes, 1);
+
+    return await crypto.subtle.importKey(
+        'raw',
+        uncompressed,
+        { name: 'ECDSA', namedCurve: 'P-256' },
+        true,
+        ['verify']
+    );
+}
+
+// Verify ECDSA signature
+async function verifySignature(publicKey, signature, data) {
+    // DNSSEC ECDSA signature is r || s (each 32 bytes for P-256)
+    // WebCrypto expects the same format for P1363
+
+    return await crypto.subtle.verify(
+        { name: 'ECDSA', hash: 'SHA-256' },
+        publicKey,
+        signature,
+        data
+    );
+}
+
+async function validate() {
+    const domain = document.getElementById('domain').value.trim();
+    const results = document.getElementById('results');
+    results.innerHTML = '<p>Loading...</p>';
+
+    try {
+        // Fetch A records with DNSSEC
+        const aResp = await fetch(`${API_BASE}?name=${encodeURIComponent(domain)}&dnssec=1`);
+        const aData = await aResp.json();
+
+        // Fetch DNSKEY records
+        const keyResp = await fetch(`${API_BASE}?name=${encodeURIComponent(domain)}&dnssec=1&type=dnskey`);
+        const keyData = await keyResp.json();
+
+        let html = '';
+
+        // Parse DNSKEYs
+        const dnskeys = keyData.Answer.filter(r => r.type === 48).map(r => ({
+            ...r,
+            parsed: parseDNSKEY(r.rdata)
+        }));
+
+        const zsk = dnskeys.find(k => k.parsed.isZSK);
+        const ksk = dnskeys.find(k => k.parsed.isKSK);
+
+        // Chain visualization
+        html += `
+        <div class="record-section">
+            <h3>Trust Chain</h3>
+            <div class="chain-viz">
+                <div class="chain-node key-record">A Records</div>
+                <span class="chain-arrow">→</span>
+                <div class="chain-node key-zsk">ZSK (${zsk?.parsed.keyTag})</div>
+                <span class="chain-arrow">→</span>
+                <div class="chain-node key-ksk">KSK (${ksk?.parsed.keyTag})</div>
+                <span class="chain-arrow">→</span>
+                <div class="chain-node" style="background:#5a4527">DS in Parent</div>
+            </div>
+        </div>`;
+
+        // === Validate A records ===
+        const aRecords = aData.Answer.filter(r => r.type === 1);
+        const aRRSIG = aData.Answer.find(r => r.type === 46);
+
+        html += `<div class="record-section"><h3>A Records</h3>`;
+
+        for (const rec of aRecords) {
+            html += `<div class="record"><pre>A ${rec.data}</pre></div>`;
+        }
+
+        if (aRRSIG) {
+            const rrsig = parseRRSIG(aRRSIG.rdata);
+            html += `<div class="record pending" id="a-rrsig">
+                <strong>RRSIG</strong> <span class="status pending">Validating...</span>
+                <div class="details">
+                    Algorithm: ${rrsig.algorithm} (ECDSA P-256) |
+                    Key Tag: ${rrsig.keyTag} |
+                    Signer: ${rrsig.signerName}
+                </div>
+            </div>`;
+
+            // Find the signing key
+            const signingKey = dnskeys.find(k => k.parsed.keyTag === rrsig.keyTag);
+
+            if (signingKey) {
+                try {
+                    const pubKey = await importECDSAKey(signingKey.parsed.publicKey);
+                    const signedData = buildSignedData(rrsig, aRecords, domain, 1);
+                    const valid = await verifySignature(pubKey, rrsig.signature, signedData);
+
+                    setTimeout(() => {
+                        const el = document.getElementById('a-rrsig');
+                        el.className = `record ${valid ? 'valid' : 'invalid'}`;
+                        el.querySelector('.status').className = `status ${valid ? 'valid' : 'invalid'}`;
+                        el.querySelector('.status').textContent = valid ? '✓ VALID' : '✗ INVALID';
+                    }, 100);
+                } catch (e) {
+                    console.error('A record validation error:', e);
+                }
+            }
+        }
+        html += `</div>`;
+
+        // === DNSKEY section ===
+        html += `<div class="record-section"><h3>DNSKEY Records</h3>`;
+
+        for (const key of dnskeys) {
+            const typeLabel = key.parsed.isKSK ? 'KSK' : 'ZSK';
+            html += `<div class="record">
+                <strong>DNSKEY (${typeLabel})</strong>
+                <div class="details">
+                    Flags: ${key.parsed.flags} |
+                    Algorithm: ${key.parsed.algorithm} |
+                    Key Tag: ${key.parsed.keyTag}
+                </div>
+                <pre style="color:#888;font-size:11px;margin-top:5px">Public Key: ${bytesToHex(key.parsed.publicKey)}</pre>
+            </div>`;
+        }
+
+        // Validate DNSKEY RRSIG
+        const dnskeyRRSIG = keyData.Answer.find(r => r.type === 46);
+        if (dnskeyRRSIG) {
+            const rrsig = parseRRSIG(dnskeyRRSIG.rdata);
+            html += `<div class="record pending" id="dnskey-rrsig">
+                <strong>RRSIG (DNSKEY)</strong> <span class="status pending">Validating...</span>
+                <div class="details">
+                    Algorithm: ${rrsig.algorithm} |
+                    Key Tag: ${rrsig.keyTag} |
+                    Signer: ${rrsig.signerName}
+                </div>
+            </div>`;
+
+            const signingKey = dnskeys.find(k => k.parsed.keyTag === rrsig.keyTag);
+
+            if (signingKey) {
+                try {
+                    const pubKey = await importECDSAKey(signingKey.parsed.publicKey);
+                    const dnskeyRecords = keyData.Answer.filter(r => r.type === 48);
+                    const signedData = buildSignedData(rrsig, dnskeyRecords, domain, 48);
+                    const valid = await verifySignature(pubKey, rrsig.signature, signedData);
+
+                    setTimeout(() => {
+                        const el = document.getElementById('dnskey-rrsig');
+                        el.className = `record ${valid ? 'valid' : 'invalid'}`;
+                        el.querySelector('.status').className = `status ${valid ? 'valid' : 'invalid'}`;
+                        el.querySelector('.status').textContent = valid ? '✓ VALID' : '✗ INVALID';
+                    }, 200);
+                } catch (e) {
+                    console.error('DNSKEY validation error:', e);
+                }
+            }
+        }
+        html += `</div>`;
+
+        // Raw data section
+        html += `<div class="record-section">
+            <h3>Raw API Responses</h3>
+            <details>
+                <summary style="cursor:pointer;color:#00d4ff">Show A record response</summary>
+                <pre class="record" style="font-size:11px">${JSON.stringify(aData, null, 2)}</pre>
+            </details>
+            <details>
+                <summary style="cursor:pointer;color:#00d4ff">Show DNSKEY response</summary>
+                <pre class="record" style="font-size:11px">${JSON.stringify(keyData, null, 2)}</pre>
+            </details>
+        </div>`;
+
+        results.innerHTML = html;
+
+    } catch (error) {
+        results.innerHTML = `<div class="record invalid">Error: ${error.message}</div>`;
+        console.error(error);
+    }
+}
+
+// Validate on load
+validate();
+    </script>
+</body>
+</html>
