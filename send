@@ -1,0 +1,1 @@
+rsync -Havz htdocs/* 192.168.3.100:/ext2/data/easy-nginx.websites/htdocs/isthisyou
